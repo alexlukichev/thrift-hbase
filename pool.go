@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	hb "github.com/alexlukichev/thrift-hbase/gen-go/hbase"
 	"github.com/apache/thrift/lib/go/thrift"
@@ -23,10 +24,11 @@ func (c HBaseClient) HBase() hb.Hbase {
 type Pool struct {
 	hostPort string
 
-	clients       chan *HBaseClient
-	poolSize      int
-	activeClients int
-	clientLock    sync.Locker
+	clients   chan *HBaseClient
+	createSem chan bool
+
+	poolSize   int
+	clientLock sync.Locker
 
 	protocolFactory  thrift.TProtocolFactory
 	transportFactory thrift.TTransportFactory
@@ -38,8 +40,8 @@ func NewPool(hostPort string, poolSize int) *Pool {
 	return &Pool{
 		hostPort:         hostPort,
 		clients:          make(chan *HBaseClient, poolSize),
+		createSem:        make(chan bool, poolSize),
 		poolSize:         poolSize,
-		activeClients:    0,
 		clientLock:       &sync.Mutex{},
 		protocolFactory:  thrift.NewTBinaryProtocolFactoryDefault(), // "binary" protocol
 		transportFactory: thrift.NewTBufferedTransportFactory(8192), // "buffered" transport
@@ -48,77 +50,65 @@ func NewPool(hostPort string, poolSize int) *Pool {
 }
 
 func (p *Pool) Acquire(ctx context.Context) (*HBaseClient, error) {
-	if p.closing {
-		return nil, PoolClosed
-	}
-
-	if p.activeClients < p.poolSize {
+	select {
+	case hbase := <-p.clients:
+		return hbase, nil
+	case <-time.After(time.Millisecond):
 		select {
 		case hbase := <-p.clients:
 			return hbase, nil
-		default:
+		case p.createSem <- true:
+			// No existing client, let's make a new one
 			hbase, err := func() (*HBaseClient, error) {
 				p.clientLock.Lock()
 				defer p.clientLock.Unlock()
 
-				if p.activeClients < p.poolSize {
-					var transport thrift.TTransport
-					transport, err := thrift.NewTSocket(p.hostPort)
-					if err != nil {
-						return nil, err
-					}
-
-					err = transport.Open()
-					if err != nil {
-						return nil, err
-					}
-
-					transport, err = p.transportFactory.GetTransport(transport)
-					if err != nil {
-						return nil, err
-					}
-
-					p.activeClients += 1
-					return &HBaseClient{
-						hbase:     hb.NewHbaseClientFactory(transport, p.protocolFactory),
-						transport: transport,
-					}, nil
-				} else {
-					return nil, nil
+				var transport thrift.TTransport
+				transport, err := thrift.NewTSocket(p.hostPort)
+				if err != nil {
+					return nil, err
 				}
+
+				err = transport.Open()
+				if err != nil {
+					return nil, err
+				}
+
+				transport, err = p.transportFactory.GetTransport(transport)
+				if err != nil {
+					return nil, err
+				}
+
+				return &HBaseClient{
+					hbase:     hb.NewHbaseClientFactory(transport, p.protocolFactory),
+					transport: transport,
+				}, nil
 			}()
-
 			if err != nil {
-				return nil, err
+				// On error, release our create hold
+				<-p.createSem
 			}
-
-			if hbase != nil {
-				return hbase, nil
-			}
+			return hbase, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-	}
-
-	select {
-	case hbase := <-p.clients:
-		return hbase, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
 	}
 }
 
 func (p *Pool) Release(hbase *HBaseClient) {
-	p.clients <- hbase
+	select {
+	case p.clients <- hbase:
+	default:
+		// pool overflow
+		<-p.createSem
+		hbase.transport.Close()
+	}
 }
 
 func (p *Pool) Close(ctx context.Context) error {
-	for p.activeClients > 0 {
-		select {
-		case hbaseClient := <-p.clients:
-			hbaseClient.transport.Close()
-			p.activeClients -= 1
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	close(p.clients)
+	for hbaseClient := range p.clients {
+		hbaseClient.transport.Close()
 	}
 	return nil
 }
