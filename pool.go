@@ -2,14 +2,11 @@ package hbase
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	hb "github.com/alexlukichev/thrift-hbase/gen-go/hbase"
 	"github.com/apache/thrift/lib/go/thrift"
 )
-
-var PoolClosed = fmt.Errorf("Pool is closed")
 
 type HBaseClient struct {
 	hbase     hb.Hbase
@@ -30,16 +27,58 @@ type Pool struct {
 
 	protocolFactory  thrift.TProtocolFactory
 	transportFactory thrift.TTransportFactory
+
+	idleCleanup *time.Ticker
+	stopCleanup chan bool
 }
 
 func NewPool(hostPort string, poolSize int) *Pool {
-	return &Pool{
+	return NewPoolWithIdleTimeout(hostPort, poolSize, 30*time.Second)
+}
+
+func NewPoolWithIdleTimeout(hostPort string, poolSize int, cleanupInterval time.Duration) *Pool {
+	ticker := time.NewTicker(cleanupInterval)
+
+	pool := &Pool{
 		hostPort:         hostPort,
 		clients:          make(chan *HBaseClient, poolSize),
 		createSem:        make(chan bool, poolSize),
 		poolSize:         poolSize,
 		protocolFactory:  thrift.NewTBinaryProtocolFactoryDefault(), // "binary" protocol
 		transportFactory: thrift.NewTBufferedTransportFactory(8192), // "buffered" transport
+		idleCleanup:      ticker,
+		stopCleanup:      make(chan bool),
+	}
+
+	// start cleanup by timer
+	go pool.cleanup()
+
+	return pool
+}
+
+func (p *Pool) cleanup() {
+	for {
+		select {
+		case <-p.stopCleanup:
+			return
+		case <-p.idleCleanup.C:
+			// release all idle clients
+			for {
+				stop := func() bool {
+					select {
+					case client := <-p.clients:
+						<-p.createSem
+						client.transport.Close()
+						return false
+					default:
+						return true
+					}
+				}()
+				if stop {
+					break
+				}
+			}
+		}
 	}
 }
 
@@ -52,7 +91,7 @@ func (p *Pool) Acquire(ctx context.Context) (*HBaseClient, error) {
 		case hbase := <-p.clients:
 			return hbase, nil
 		case p.createSem <- true:
-			// No existing client, let's make a new one
+			// No clients available, let's make a new one
 			hbase, err := func() (*HBaseClient, error) {
 				var transport thrift.TTransport
 				transport, err := thrift.NewTSocket(p.hostPort)
@@ -76,7 +115,7 @@ func (p *Pool) Acquire(ctx context.Context) (*HBaseClient, error) {
 				}, nil
 			}()
 			if err != nil {
-				// On error, release our create hold
+				// On error, release sem
 				<-p.createSem
 			}
 			return hbase, nil
@@ -97,9 +136,12 @@ func (p *Pool) Release(hbase *HBaseClient) {
 }
 
 func (p *Pool) Close(ctx context.Context) error {
+	p.idleCleanup.Stop()
+	p.stopCleanup <- true
+	close(p.createSem)
 	close(p.clients)
-	for hbaseClient := range p.clients {
-		hbaseClient.transport.Close()
+	for client := range p.clients {
+		client.transport.Close()
 	}
 	return nil
 }
