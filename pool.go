@@ -3,7 +3,6 @@ package hbase
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	hb "github.com/alexlukichev/thrift-hbase/gen-go/hbase"
@@ -27,13 +26,10 @@ type Pool struct {
 	clients   chan *HBaseClient
 	createSem chan bool
 
-	poolSize   int
-	clientLock sync.Locker
+	poolSize int
 
 	protocolFactory  thrift.TProtocolFactory
 	transportFactory thrift.TTransportFactory
-
-	closing bool
 }
 
 func NewPool(hostPort string, poolSize int) *Pool {
@@ -42,10 +38,8 @@ func NewPool(hostPort string, poolSize int) *Pool {
 		clients:          make(chan *HBaseClient, poolSize),
 		createSem:        make(chan bool, poolSize),
 		poolSize:         poolSize,
-		clientLock:       &sync.Mutex{},
 		protocolFactory:  thrift.NewTBinaryProtocolFactoryDefault(), // "binary" protocol
 		transportFactory: thrift.NewTBufferedTransportFactory(8192), // "buffered" transport
-		closing:          false,
 	}
 }
 
@@ -60,9 +54,6 @@ func (p *Pool) Acquire(ctx context.Context) (*HBaseClient, error) {
 		case p.createSem <- true:
 			// No existing client, let's make a new one
 			hbase, err := func() (*HBaseClient, error) {
-				p.clientLock.Lock()
-				defer p.clientLock.Unlock()
-
 				var transport thrift.TTransport
 				transport, err := thrift.NewTSocket(p.hostPort)
 				if err != nil {
