@@ -2,15 +2,22 @@ package hbase
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	hb "github.com/alexlukichev/thrift-hbase/gen-go/hbase"
 	"github.com/apache/thrift/lib/go/thrift"
+	"github.com/op/go-logging"
 )
+
+var log = logging.MustGetLogger("thrift-hbase")
+
+var clientId uint64 = 0
 
 type HBaseClient struct {
 	hbase     hb.Hbase
 	transport thrift.TTransport
+	id        uint64
 }
 
 func (c HBaseClient) HBase() hb.Hbase {
@@ -38,7 +45,7 @@ func NewPool(hostPort string, poolSize int) *Pool {
 
 func NewPoolWithIdleTimeout(hostPort string, poolSize int, cleanupInterval time.Duration) *Pool {
 	ticker := time.NewTicker(cleanupInterval)
-
+	log.Debugf("new pool hostPort=%s, poolSize=%d, cleanupInterval=%s", hostPort, poolSize, cleanupInterval.String())
 	pool := &Pool{
 		hostPort:         hostPort,
 		clients:          make(chan *HBaseClient, poolSize),
@@ -62,19 +69,23 @@ func (p *Pool) cleanup() {
 		case <-p.stopCleanup:
 			return
 		case <-p.idleCleanup.C:
+			log.Debugf("cleanup: looking for idle clients")
 			// release all idle clients
 			for {
 				stop := func() bool {
 					select {
 					case client := <-p.clients:
+						log.Debugf("client(id=%d): closing idle client", client.id)
 						<-p.createSem
 						client.transport.Close()
 						return false
 					default:
+						log.Debug("cleanup: no idle clients found")
 						return true
 					}
 				}()
 				if stop {
+					log.Debug("cleanup: completed")
 					break
 				}
 			}
@@ -85,12 +96,15 @@ func (p *Pool) cleanup() {
 func (p *Pool) Acquire(ctx context.Context) (*HBaseClient, error) {
 	select {
 	case hbase := <-p.clients:
+		log.Debugf("acquire success: using existing client (id=%d)", hbase.id)
 		return hbase, nil
 	case <-time.After(time.Millisecond):
 		select {
 		case hbase := <-p.clients:
+			log.Debugf("acquire success: using existing client (id=%d)", hbase.id)
 			return hbase, nil
 		case p.createSem <- true:
+			log.Debug("acquire: no clients available, opening new socket")
 			// No clients available, let's make a new one
 			hbase, err := func() (*HBaseClient, error) {
 				var transport thrift.TTransport
@@ -109,15 +123,21 @@ func (p *Pool) Acquire(ctx context.Context) (*HBaseClient, error) {
 					return nil, err
 				}
 
+				newId := atomic.AddUint64(&clientId, +1)
+
 				return &HBaseClient{
 					hbase:     hb.NewHbaseClientFactory(transport, p.protocolFactory),
 					transport: transport,
+					id:        newId,
 				}, nil
 			}()
 			if err != nil {
+				log.Errorf("acquire failure: couldn't create new client: %s", err.Error())
 				// On error, release sem
 				<-p.createSem
+				return nil, err
 			}
+			log.Debugf("acquire success: created new client (id=%d)", hbase.id)
 			return hbase, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -128,14 +148,22 @@ func (p *Pool) Acquire(ctx context.Context) (*HBaseClient, error) {
 func (p *Pool) Release(hbase *HBaseClient) {
 	select {
 	case p.clients <- hbase:
+		log.Debugf("client (id=%d): returned to queue", hbase.id)
 	default:
+		log.Debugf("pool overflow: closing client (id=%d)", hbase.id)
 		// pool overflow
 		<-p.createSem
-		hbase.transport.Close()
+		err := hbase.transport.Close()
+		if err != nil {
+			log.Errorf("client (id=%d): error on closing client: %s", err.Error())
+		} else {
+			log.Debugf("client (id=%d): closed successfully", hbase.id)
+		}
 	}
 }
 
 func (p *Pool) Close(ctx context.Context) error {
+	log.Debug("closing pool...")
 	p.idleCleanup.Stop()
 	p.stopCleanup <- true
 	close(p.createSem)
@@ -143,5 +171,6 @@ func (p *Pool) Close(ctx context.Context) error {
 	for client := range p.clients {
 		client.transport.Close()
 	}
+	log.Debug("pool closed successfully")
 	return nil
 }
