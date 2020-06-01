@@ -78,15 +78,14 @@ func (p *Pool) startCleanupTimer(c *HBaseClient) {
 		select {
 		case client := <-p.clients:
 			if client.id == c.id {
-				log.Debugf("client(id=%d): closing idle client", client.id)
-				<-p.createSem
-				client.transport.Close()
+				log.Debugf("closing idle client (id=%d)", client.id)
 			} else {
 				log.Error("cleanup algorithm error: client id is different id=%s", client.id)
-				p.Release(client)
 			}
+			<-p.createSem
+			client.transport.Close()
 		default:
-			log.Error("cleanup algorithm error: timer was not stopped")
+			log.Errorf("cleanup algorithm error: timer (id=%d) was not stopped", c.id)
 		}
 	})
 }
