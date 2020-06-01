@@ -15,13 +15,28 @@ var log = logging.MustGetLogger("thrift-hbase")
 var clientId uint64 = 0
 
 type HBaseClient struct {
-	hbase     hb.Hbase
-	transport thrift.TTransport
-	id        uint64
+	hbase        hb.Hbase
+	transport    thrift.TTransport
+	id           uint64
+	cleanupTimer *time.Timer
 }
 
 func (c HBaseClient) HBase() hb.Hbase {
 	return c.hbase
+}
+
+func (c *HBaseClient) stopCleanupTimer() error {
+	log.Debugf("stopped cleanup timer for client (id=%d)", c.id)
+	if c.cleanupTimer != nil {
+		res := c.cleanupTimer.Stop()
+		if !res {
+			log.Error("cleanup timer is already expired")
+		}
+		c.cleanupTimer = nil
+	} else {
+		log.Error("cleanup algorithm error: stop for non-existing timer")
+	}
+	return nil
 }
 
 type Pool struct {
@@ -35,8 +50,7 @@ type Pool struct {
 	protocolFactory  thrift.TProtocolFactory
 	transportFactory thrift.TTransportFactory
 
-	idleCleanup *time.Ticker
-	stopCleanup chan bool
+	cleanupInterval time.Duration
 }
 
 func NewPool(hostPort string, poolSize int) *Pool {
@@ -44,7 +58,6 @@ func NewPool(hostPort string, poolSize int) *Pool {
 }
 
 func NewPoolWithIdleTimeout(hostPort string, poolSize int, cleanupInterval time.Duration) *Pool {
-	ticker := time.NewTicker(cleanupInterval)
 	log.Debugf("new pool hostPort=%s, poolSize=%d, cleanupInterval=%s", hostPort, poolSize, cleanupInterval.String())
 	pool := &Pool{
 		hostPort:         hostPort,
@@ -53,54 +66,41 @@ func NewPoolWithIdleTimeout(hostPort string, poolSize int, cleanupInterval time.
 		poolSize:         poolSize,
 		protocolFactory:  thrift.NewTBinaryProtocolFactoryDefault(), // "binary" protocol
 		transportFactory: thrift.NewTBufferedTransportFactory(8192), // "buffered" transport
-		idleCleanup:      ticker,
-		stopCleanup:      make(chan bool),
+		cleanupInterval:  cleanupInterval,
 	}
-
-	// start cleanup by timer
-	go pool.cleanup()
-
 	return pool
 }
 
-func (p *Pool) cleanup() {
-	for {
+func (p *Pool) startCleanupTimer(c *HBaseClient) {
+	log.Debugf("started cleanup timer for client (id=%d)", c.id)
+	c.cleanupTimer = time.AfterFunc(p.cleanupInterval, func() {
+		log.Debugf("client (id=%d): cleanup timer is triggered", c.id)
 		select {
-		case <-p.stopCleanup:
-			return
-		case <-p.idleCleanup.C:
-			log.Debugf("cleanup: looking for idle clients")
-			// release all idle clients
-			for {
-				stop := func() bool {
-					select {
-					case client := <-p.clients:
-						log.Debugf("client(id=%d): closing idle client", client.id)
-						<-p.createSem
-						client.transport.Close()
-						return false
-					default:
-						log.Debug("cleanup: no idle clients found")
-						return true
-					}
-				}()
-				if stop {
-					log.Debug("cleanup: completed")
-					break
-				}
+		case client := <-p.clients:
+			if client.id == c.id {
+				log.Debugf("client(id=%d): closing idle client", client.id)
+				<-p.createSem
+				client.transport.Close()
+			} else {
+				log.Error("cleanup algorithm error: client id is different id=%s", client.id)
+				p.Release(client)
 			}
+		default:
+			log.Error("cleanup algorithm error: timer was not stopped")
 		}
-	}
+	})
 }
 
 func (p *Pool) Acquire(ctx context.Context) (*HBaseClient, error) {
 	select {
 	case hbase := <-p.clients:
+		hbase.stopCleanupTimer()
 		log.Debugf("acquire success: using existing client (id=%d)", hbase.id)
 		return hbase, nil
 	case <-time.After(time.Millisecond):
 		select {
 		case hbase := <-p.clients:
+			hbase.stopCleanupTimer()
 			log.Debugf("acquire success: using existing client (id=%d)", hbase.id)
 			return hbase, nil
 		case p.createSem <- true:
@@ -148,6 +148,7 @@ func (p *Pool) Acquire(ctx context.Context) (*HBaseClient, error) {
 func (p *Pool) Release(hbase *HBaseClient) {
 	select {
 	case p.clients <- hbase:
+		p.startCleanupTimer(hbase)
 		log.Debugf("client (id=%d): returned to queue", hbase.id)
 	default:
 		log.Debugf("pool overflow: closing client (id=%d)", hbase.id)
@@ -164,12 +165,12 @@ func (p *Pool) Release(hbase *HBaseClient) {
 
 func (p *Pool) Close(ctx context.Context) error {
 	log.Debug("closing pool...")
-	p.idleCleanup.Stop()
-	p.stopCleanup <- true
 	close(p.createSem)
 	close(p.clients)
 	for client := range p.clients {
+		client.stopCleanupTimer()
 		client.transport.Close()
+		log.Debugf("client (id=%d) was released", client.id)
 	}
 	log.Debug("pool closed successfully")
 	return nil

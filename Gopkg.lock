@@ -31,6 +31,14 @@
   version = "v0.2.0"
 
 [[projects]]
+  digest = "1:5b3b29ce0e569f62935d9541dff2e16cc09df981ebde48e82259076a73a3d0c7"
+  name = "github.com/op/go-logging"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "b2cb9fa56473e98db8caba80237377e83fe44db5"
+  version = "v1"
+
+[[projects]]
   digest = "1:cf31692c14422fa27c83a05292eb5cbe0fb2775972e8f1f8446a71549bd8980b"
   name = "github.com/pkg/errors"
   packages = ["."]
@@ -58,6 +66,7 @@
   input-imports = [
     "github.com/alexlukichev/thrift-hbase/gen-go/hbase",
     "github.com/apache/thrift/lib/go/thrift",
+    "github.com/op/go-logging",
     "gotest.tools/assert",
   ]
   solver-name = "gps-cdcl"
